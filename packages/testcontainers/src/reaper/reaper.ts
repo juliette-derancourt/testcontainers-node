@@ -5,6 +5,7 @@ import { Socket } from "net";
 import { ContainerRuntimeClient, ImageName } from "../container-runtime";
 import { IntervalRetry, log, RandomUuid, withFileLock } from "../common";
 import { LABEL_TESTCONTAINERS_SESSION_ID } from "../utils/labels";
+import { ContainerRuntimeInfo } from "../container-runtime/clients/types";
 
 export const REAPER_IMAGE = process.env["RYUK_CONTAINER_IMAGE"]
   ? ImageName.fromString(process.env["RYUK_CONTAINER_IMAGE"]).string
@@ -32,11 +33,9 @@ export async function getReaper(client: ContainerRuntimeClient): Promise<Reaper>
 
     if (process.env.TESTCONTAINERS_RYUK_DISABLED === "true") {
       return new DisabledReaper(sessionId);
-    } else if (reaperContainer) {
-      return await useExistingReaper(reaperContainer, sessionId, client.info.containerRuntime.host);
-    } else {
-      return await createNewReaper(sessionId, client.info.containerRuntime.remoteSocketPath);
     }
+
+    return createOrReuseReaper(reaperContainer, sessionId, client.info.containerRuntime);
   });
 
   reaper.addSession(sessionId);
@@ -48,6 +47,25 @@ async function findReaperContainer(client: ContainerRuntimeClient): Promise<Cont
   return containers.find(
     (container) => container.State === "running" && container.Labels["org.testcontainers.ryuk"] === "true"
   );
+}
+
+async function createOrReuseReaper(
+  reaperContainer: ContainerInfo | undefined,
+  sessionId: string,
+  containerRuntime: ContainerRuntimeInfo
+): Promise<Reaper> {
+  if (!reaperContainer) {
+    return await createNewReaper(sessionId, containerRuntime.remoteSocketPath);
+  }
+
+  try {
+    return await useExistingReaper(reaperContainer, sessionId, containerRuntime.host);
+  } catch (error) {
+    if (error instanceof FailedConnectingToReaper) {
+      return createNewReaper(sessionId, containerRuntime.remoteSocketPath);
+    }
+    throw error;
+  }
 }
 
 async function useExistingReaper(reaperContainer: ContainerInfo, sessionId: string, host: string): Promise<Reaper> {
@@ -118,9 +136,9 @@ async function connectToReaperSocket(host: string, port: number, containerId: st
     },
     (result) => result !== undefined,
     () => {
-      const message = `Failed to connect to Reaper`;
-      log.error(message, { containerId });
-      return new Error(message);
+      const error = new FailedConnectingToReaper();
+      log.error(error.message, { containerId });
+      return error;
     },
     4000
   );
@@ -129,6 +147,12 @@ async function connectToReaperSocket(host: string, port: number, containerId: st
     return retryResult;
   } else {
     throw retryResult;
+  }
+}
+
+class FailedConnectingToReaper extends Error {
+  constructor() {
+    super("Failed to connect to Reaper");
   }
 }
 
